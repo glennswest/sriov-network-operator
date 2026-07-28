@@ -379,13 +379,20 @@ func runStartCmd(cmd *cobra.Command, args []string) error {
 			hygieneScope = parsed
 		}
 
+		// VF lifecycle is reported to the cluster as Kubernetes Events on this
+		// node's SriovNetworkNodeState, so the release the device-plugin API
+		// never reports, and any failure to clean a released VF, are visible
+		// with kubectl and can be alerted on.
+		hygieneRecorder := vfhygiene.NewKubeRecorder(kClient, kubeclient, scheme)
+		defer hygieneRecorder.Shutdown()
+
 		sweeper := vfhygiene.New(
 			vfhygiene.NewSysfsLister(),
 			vfhygiene.NewCNIAllocationChecker(),
 			vfhygiene.NewNetlinkStateOps(),
 			vfhygiene.NewCNIDeviceLocker(),
 			vfhygiene.NewStandardKnownValues(),
-			nil,
+			hygieneRecorder,
 			vfhygiene.Config{
 				Scope:    hygieneScope,
 				Interval: startOpts.vfHygieneInterval,
