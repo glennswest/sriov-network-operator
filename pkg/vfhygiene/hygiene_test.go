@@ -572,3 +572,88 @@ func TestParseAttributes(t *testing.T) {
 		t.Fatal("an empty attribute list must be rejected")
 	}
 }
+
+// --- stopping delivery to a vport whose consumer is gone --------------------
+//
+// Clearing promiscuous mode removes only the eSwitch rule that replicates
+// everything to a vport. The vport's own unicast MAC filter, the multicast
+// addresses the workload subscribed to, its VLAN filter entries and its queues
+// all survive, so traffic addressed to that VF continues to be delivered into
+// queues nobody is draining. Field evidence is consistent with this: with the
+// VF released and promiscuous mode cleared, discard and pause counters kept
+// climbing, and only a full unbind stopped them.
+//
+// The cleanup therefore cannot rely on clearing promiscuity alone. These tests
+// pin the two levers that stop delivery without a rebind.
+
+// TestReleasedVFIsBroughtDown checks that a released VF is not left
+// administratively up. An up vport keeps accepting frames that match its
+// filters even with promiscuous mode off.
+func TestReleasedVFIsBroughtDown(t *testing.T) {
+	st := newFakeState()
+	st.state[testVFPCI] = State{
+		HasNetdev: true, AdminUp: true, Promisc: true,
+		HasVFInfo: true, AdminMAC: "00:00:00:00:00:00", SpoofChk: true, MTU: 1500,
+	}
+
+	s := New(&fakeLister{vfs: []VF{testVF()}}, &fakeAllocation{}, st, nil, defaultKnown(), nil, Config{})
+	if _, err := s.SweepOnce(); err != nil {
+		t.Fatalf("SweepOnce returned error: %v", err)
+	}
+
+	got := st.state[testVFPCI]
+	if got.AdminUp {
+		t.Error("a released VF must not be left administratively up; an up vport still " +
+			"accepts frames matching its filters after promiscuous mode is cleared")
+	}
+	if got.Promisc {
+		t.Error("promiscuous mode not cleared")
+	}
+}
+
+// TestClearingPromiscAloneIsNotTreatedAsSufficient guards the scope itself: if
+// someone narrows the default set to promiscuous mode only, the VF is left up
+// and its identity intact, which is the configuration that reproduced the
+// original symptom. The test documents that promisc-only is a deliberate
+// choice, not the default.
+func TestClearingPromiscAloneIsNotTreatedAsSufficient(t *testing.T) {
+	for _, attr := range []Attribute{AttrAdminUp, AttrLinkState, AttrAdminMAC} {
+		found := false
+		for _, a := range AllAttributes {
+			if a == attr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%q must be in the default scope: clearing promiscuous mode alone "+
+				"leaves the vport receiving traffic addressed to it", attr)
+		}
+	}
+}
+
+// TestReleasedVFLinkStateReturnsToKnownValue pins the second lever. Link state
+// is PF-side, so it applies to a VF with no netdev -- the userspace-driver case
+// where there is nothing to bring down.
+func TestReleasedVFLinkStateReturnsToKnownValue(t *testing.T) {
+	vf := testVF()
+	vf.NetdevName = "" // vfio-pci bound: no netdev to set down
+
+	st := newFakeState()
+	st.state[testVFPCI] = State{
+		HasVFInfo: true, LinkState: 1, AdminMAC: "00:00:00:00:00:00", SpoofChk: true,
+	}
+
+	known := &fixedKnown{state: State{
+		HasVFInfo: true, LinkState: 0, AdminMAC: "00:00:00:00:00:00", SpoofChk: true,
+	}}
+
+	s := New(&fakeLister{vfs: []VF{vf}}, &fakeAllocation{}, st, nil, known, nil, Config{})
+	if _, err := s.SweepOnce(); err != nil {
+		t.Fatalf("SweepOnce returned error: %v", err)
+	}
+
+	if st.state[testVFPCI].LinkState != 0 {
+		t.Fatalf("link state not returned to the known value, got %d", st.state[testVFPCI].LinkState)
+	}
+}

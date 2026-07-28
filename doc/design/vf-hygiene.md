@@ -266,3 +266,15 @@ Planned, on SR-IOV hardware, before this is proposed upstream:
   the only path.
 - Confirmation that a restored VF is usable by a subsequent workload, which is
   the property the whole component exists to provide.
+- **That returning the VF to the known state actually stops delivery to it.**
+  Clearing promiscuous mode removes only the rule that replicates everything to
+  a vport; its unicast MAC filter, subscribed multicast addresses, VLAN filter
+  entries and queues all survive, so traffic addressed to that VF can continue
+  to arrive into queues nobody is draining. Field evidence is consistent with
+  this — with the VF released and promiscuous mode cleared, discard and pause
+  counters kept climbing, and only a full unbind stopped them. The test measures
+  per-vport receive and discard counters after each step in turn: promiscuity
+  cleared, then admin-down, then link state disabled. The step at which delivery
+  stops identifies what is sufficient. If none of them do, flushing the filter
+  lists is required, and the gap recorded above becomes a blocker rather than a
+  limitation.
