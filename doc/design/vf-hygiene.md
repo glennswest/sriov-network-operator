@@ -49,8 +49,17 @@ Neither existing in-band path closes the gap. In sriov-cni:
   userspace-driver workloads.
 
 The operator itself restores only the administrative attributes it configured,
-by design. This proposal does not dispute that scoping; it proposes extending it
-deliberately, with the new scope stated explicitly.
+by design. This proposal does not dispute that scoping as a description of what
+the operator configures — it proposes extending what the operator *guarantees on
+release*, deliberately and with the new scope stated explicitly.
+
+The justification is the same as for the default (see "Why this is enabled by
+default"): the alternative to the
+platform guaranteeing a known state is that every consumer of every VF must
+defend against arbitrary inherited configuration, and must diagnose it without
+any signal pointing at the device. Scoping the guarantee to "attributes we
+happened to set" leaves the failure mode fully intact, because the attributes
+that cause the damage are precisely the ones the operator did not set.
 
 ### Use Cases
 
@@ -196,13 +205,31 @@ narrower than the set attempted.
   are not yet covered. A consumer can change any of these and they survive its
   exit. This is the largest piece of remaining work.
 
-### Upgrade & Downgrade considerations
+### Why this is enabled by default
 
-The component is enabled by default, on the grounds that the failures it
-prevents are hard to attribute, so operators who would benefit from an opt-in
-switch are precisely those who have not yet worked out that they need it. A flag
-disables it entirely for anyone who needs to observe the unclean behaviour
-without interference.
+Other optional config-daemon behaviours are opt-in, so this warrants an explicit
+argument rather than an assumption.
+
+A VF recycled with a previous consumer's configuration behaves like a fault
+injected at random: it lands on whichever workload next receives that VF, it
+produces different symptoms depending on which attribute was left set and what
+the new workload does with the device, and none of those symptoms names the
+cause. The operational cost is therefore not one incident but an ongoing source
+of unreproducible behaviour, investigated repeatedly and attributed elsewhere.
+
+That is what makes an opt-in switch the wrong shape. The operators who need this
+are, by construction, the ones who have not yet determined that stale VF state is
+what they are chasing — so a flag they must first know to set delivers the fix to
+everyone except the people currently paying for its absence.
+
+Returning a device to a known state before reuse is a property the platform
+should provide as a matter of course, in the same way it does not hand out a
+partially configured VF at allocation time. `--vf-hygiene-disable` turns the
+component off entirely for anyone who needs to observe the unclean behaviour
+without interference, and `--vf-hygiene-dry-run` reports what would change
+without changing it.
+
+### Upgrade & Downgrade considerations
 
 On upgrade, existing VFs are evaluated on the first sweep. Downgrade removes the
 component; no persistent state is written, so nothing is left behind.
@@ -218,7 +245,12 @@ component; no persistent state is written, so nothing is left behind.
 - Kernel-level tests against real netlink on dummy interfaces: flags are read
   and cleared, MTU and MAC are returned to the known values, and a device
   standing in for an in-use VF is untouched.
-- Not yet covered, and requiring SR-IOV hardware: the PF-side restore path
-  against a real PF VF table, and the netns-return trigger — which cannot be
-  reproduced with virtual interfaces, since a dummy or veth is destroyed with
-  its namespace rather than relocated to the initial namespace as a VF is.
+- On SR-IOV hardware, to be completed before this is proposed upstream: the
+  PF-side restore path against a real PF VF table, across more than one PF
+  driver so that the capability-detection path is exercised on a driver that
+  does not implement the full attribute set; and the netns-return trigger,
+  which cannot be reproduced with virtual interfaces, since a dummy or veth is
+  destroyed with its namespace rather than relocated to the initial namespace
+  as a VF is. Both graceful pod deletion and abrupt termination are covered,
+  including a VF bound to a userspace driver, for which no link event is
+  emitted and the periodic sweep is the only path.
