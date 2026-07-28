@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	ocpconfigapi "github.com/openshift/api/config/v1"
 	"github.com/spf13/cobra"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -47,6 +49,7 @@ import (
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platform"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vfhygiene"
 )
 
 // stringList is a list of strings, implements pflag.Value interface
@@ -88,6 +91,11 @@ var (
 		parallelNicConfig     bool
 		manageSoftwareBridges bool
 		ovsSocketPath         string
+		vfHygieneInterval     time.Duration
+		vfHygieneDryRun       bool
+		vfHygieneWatch        bool
+		vfHygieneDisable      bool
+		vfHygieneAttributes   stringList
 	}
 
 	scheme = runtime.NewScheme()
@@ -102,6 +110,17 @@ func init() {
 	startCmd.PersistentFlags().BoolVar(&startOpts.parallelNicConfig, "parallel-nic-config", false, "perform NIC configuration in parallel")
 	startCmd.PersistentFlags().BoolVar(&startOpts.manageSoftwareBridges, "manage-software-bridges", false, "enable management of software bridges")
 	startCmd.PersistentFlags().StringVar(&startOpts.ovsSocketPath, "ovs-socket-path", vars.OVSDBSocketPath, "path for OVSDB socket")
+	startCmd.PersistentFlags().DurationVar(&startOpts.vfHygieneInterval, "vf-hygiene-interval", vfhygiene.DefaultInterval,
+		"interval for the VF hygiene sweep, which restores VF state left behind by a departed consumer. 0 disables the sweep and leaves cleanup to link events alone")
+	startCmd.PersistentFlags().BoolVar(&startOpts.vfHygieneDisable, "vf-hygiene-disable", false,
+		"turn off VF hygiene entirely. A VF returned to the pool carrying a previous consumer's state is a source of hard-to-attribute failures, so this is on by default; disable only if the behaviour must be inspected without interference")
+	startCmd.PersistentFlags().VarP(&startOpts.vfHygieneAttributes, "vf-hygiene-attributes", "",
+		"comma-separated VF attributes to restore on a released VF. Defaults to all of: "+vfhygiene.AttributeNames()+
+			". Attributes a NIC driver does not implement are detected at runtime and skipped")
+	startCmd.PersistentFlags().BoolVar(&startOpts.vfHygieneDryRun, "vf-hygiene-dry-run", false,
+		"report VFs the hygiene sweep would restore without changing them")
+	startCmd.PersistentFlags().BoolVar(&startOpts.vfHygieneWatch, "vf-hygiene-watch", true,
+		"clean released VFs on kernel link events as they are returned to the host, instead of waiting for the next sweep. The sweep remains the backstop for VFs with no netdev (vfio-pci) and for events missed while the daemon was down")
 
 	// Init Scheme
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -341,6 +360,67 @@ func runStartCmd(cmd *cobra.Command, args []string) error {
 	if err = daemon.NewOperatorConfigNodeReconcile(kClient).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create setup daemon manager for OperatorConfig")
 		os.Exit(1)
+	}
+
+	// Cleanup of last resort: reset receive-path state left behind on VFs whose
+	// consumer has departed. Deliberately registered as its own Runnable with its
+	// own timer rather than as part of the nodeState reconcile above, because a VF
+	// is dirtied at pod teardown -- an event that produces no nodeState change --
+	// and because work routed through that path requests a node drain.
+	if !startOpts.vfHygieneDisable {
+		// nil scope means every attribute the component knows about.
+		var hygieneScope []vfhygiene.Attribute
+		if len(startOpts.vfHygieneAttributes) > 0 {
+			parsed, err := vfhygiene.ParseAttributes(startOpts.vfHygieneAttributes)
+			if err != nil {
+				setupLog.Error(err, "invalid --vf-hygiene-attributes")
+				os.Exit(1)
+			}
+			hygieneScope = parsed
+		}
+
+		sweeper := vfhygiene.New(
+			vfhygiene.NewSysfsLister(),
+			vfhygiene.NewCNIAllocationChecker(),
+			vfhygiene.NewNetlinkStateOps(),
+			vfhygiene.NewCNIDeviceLocker(),
+			vfhygiene.NewStandardKnownValues(),
+			nil,
+			vfhygiene.Config{
+				Scope:    hygieneScope,
+				Interval: startOpts.vfHygieneInterval,
+				DryRun:   startOpts.vfHygieneDryRun,
+			})
+		// The sweep and the link watcher are gated independently: the watcher
+		// is the primary trigger and the sweep is the backstop, so either can
+		// run without the other.
+		if startOpts.vfHygieneInterval > 0 {
+			if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+				return sweeper.Run(ctx)
+			})); err != nil {
+				setupLog.Error(err, "unable to register the VF hygiene sweep")
+				os.Exit(1)
+			}
+		}
+
+		// Event-driven cleanup. Kubernetes gives no release notification --
+		// the kubelet device-plugin API has Allocate and no Free -- but the
+		// kernel returns a VF's netdev to the initial namespace when a pod
+		// namespace is destroyed, on graceful exit and on crash alike, and
+		// that emits a link event. The sweep above remains the backstop.
+		if startOpts.vfHygieneWatch {
+			watcher := vfhygiene.NewWatcher(sweeper, vfhygiene.NewSysfsLister())
+			if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+				return watcher.Run(ctx)
+			})); err != nil {
+				setupLog.Error(err, "unable to register the VF hygiene link watcher")
+				os.Exit(1)
+			}
+		}
+
+		setupLog.Info("VF hygiene enabled",
+			"interval", startOpts.vfHygieneInterval, "dry-run", startOpts.vfHygieneDryRun,
+			"watch-link-events", startOpts.vfHygieneWatch)
 	}
 
 	setupLog.Info("Starting Manager")
