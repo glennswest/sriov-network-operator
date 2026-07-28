@@ -236,21 +236,33 @@ component; no persistent state is written, so nothing is left behind.
 
 ### Test Plan
 
+**Status: not yet executed on hardware.** Automated tests exist and pass on a
+development host, but no part of this has been validated against an SR-IOV NIC.
+The rest of this section is the intended plan, not a report of completed work.
+
+Automated coverage that exists today:
+
 - Unit coverage for the sweep decision logic: allocated VFs are never touched;
   VFs with unknown allocation state are skipped; scope is respected; dry-run
-  changes nothing; unsupported attributes do not block the rest.
+  changes nothing; a driver-unsupported attribute does not block the rest.
 - Race coverage: a VF re-allocated between the unlocked pre-check and the lock
   is left alone; a device held by another component is skipped rather than
   waited on.
 - Kernel-level tests against real netlink on dummy interfaces: flags are read
   and cleared, MTU and MAC are returned to the known values, and a device
   standing in for an in-use VF is untouched.
-- On SR-IOV hardware, to be completed before this is proposed upstream: the
-  PF-side restore path against a real PF VF table, across more than one PF
-  driver so that the capability-detection path is exercised on a driver that
-  does not implement the full attribute set; and the netns-return trigger,
-  which cannot be reproduced with virtual interfaces, since a dummy or veth is
-  destroyed with its namespace rather than relocated to the initial namespace
-  as a VF is. Both graceful pod deletion and abrupt termination are covered,
-  including a VF bound to a userspace driver, for which no link event is
-  emitted and the periodic sweep is the only path.
+
+Planned, on SR-IOV hardware, before this is proposed upstream:
+
+- The PF-side restore path against a real PF VF table, across more than one PF
+  driver, so that capability detection is exercised on a driver that does not
+  implement the full attribute set.
+- The netns-return trigger. This cannot be reproduced with virtual interfaces,
+  since a dummy or veth is destroyed with its namespace rather than relocated to
+  the initial namespace as a VF is, so the event path has so far been exercised
+  only by driving the handler directly.
+- Graceful pod deletion and abrupt termination, including a VF bound to a
+  userspace driver, for which no link event is emitted and the periodic sweep is
+  the only path.
+- Confirmation that a restored VF is usable by a subsequent workload, which is
+  the property the whole component exists to provide.
