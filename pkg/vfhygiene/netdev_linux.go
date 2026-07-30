@@ -133,9 +133,17 @@ func (o *NetlinkStateOps) restoreOne(vf VF, vfLink, pfLink netlink.Link, target 
 	switch attr {
 	// --- netdev-level ---
 	case AttrPromisc:
-		// Equivalent to: ip link set $netdev promisc off
-		if err := netlink.SetPromiscOff(vfLink); err != nil {
-			return fmt.Errorf("failed to disable promiscuous mode on %s: %w", vf.NetdevName, err)
+		// Promiscuity is a reference count, not a flag. IFLA_PROMISCUITY
+		// reports how many outstanding requests for promiscuous mode
+		// exist, and clearing IFF_PROMISC over rtnetlink decrements it by
+		// one. A workload that requested it more than once, or a device
+		// with another requester still attached, therefore stays
+		// promiscuous after a single clear.
+		//
+		// Equivalent to: ip link set $netdev promisc off, repeated until
+		// `ip -d link` shows promiscuity 0.
+		if err := clearPromiscuity(vfLink, vf.NetdevName); err != nil {
+			return err
 		}
 	case AttrAllMulticast:
 		// Equivalent to: ip link set $netdev allmulticast off
@@ -228,6 +236,43 @@ func (o *NetlinkStateOps) restoreOne(vf VF, vfLink, pfLink netlink.Link, target 
 // vlanProto8021q is the default VLAN protocol, matching sriov-cni's fallback
 // when no protocol was cached.
 const vlanProto8021q = 0x8100
+
+// maxPromiscClears bounds the decrement loop. A released VF should have a
+// reference count of one or a small number; a count that will not come down is
+// a device still in use by something, and continuing to decrement it would be
+// worse than reporting the failure.
+const maxPromiscClears = 8
+
+// clearPromiscuity drives the promiscuity reference count to zero.
+//
+// Each clear decrements the count by one, so the device is re-read after every
+// attempt rather than assuming one call was enough. Reaching zero is the
+// success condition; exhausting the attempts means something else holds a
+// reference and the VF must not be reported as clean.
+func clearPromiscuity(link netlink.Link, name string) error {
+	for i := 0; i < maxPromiscClears; i++ {
+		fresh, err := netlink.LinkByName(name)
+		if err != nil {
+			return fmt.Errorf("failed to re-read netdev %s: %w", name, err)
+		}
+		if fresh.Attrs().Promisc == 0 {
+			return nil
+		}
+		if err := netlink.SetPromiscOff(fresh); err != nil {
+			return fmt.Errorf("failed to disable promiscuous mode on %s: %w", name, err)
+		}
+	}
+
+	fresh, err := netlink.LinkByName(name)
+	if err != nil {
+		return fmt.Errorf("failed to re-read netdev %s: %w", name, err)
+	}
+	if count := fresh.Attrs().Promisc; count != 0 {
+		return fmt.Errorf("promiscuity on %s did not reach zero after %d clears (still %d): "+
+			"another requester holds a reference", name, maxPromiscClears, count)
+	}
+	return nil
+}
 
 func findVFInfo(pfLink netlink.Link, index int) *netlink.VfInfo {
 	vfs := pfLink.Attrs().Vfs

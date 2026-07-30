@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 func requireRoot(t *testing.T) {
@@ -253,3 +254,107 @@ func TestKernelRestoresMTUAndMACFromBaseline(t *testing.T) {
 		t.Error("promiscuous mode not cleared")
 	}
 }
+
+// TestKernelClearsPromiscuityReferenceCount covers the fact that promiscuity is
+// a reference count rather than a flag.
+//
+// IFLA_PROMISCUITY reports how many outstanding requests exist, and clearing
+// IFF_PROMISC over rtnetlink decrements it by one. A workload that requested
+// promiscuous mode more than once therefore leaves a count above one, and a
+// single clear would leave the device promiscuous while reporting success.
+func TestKernelClearsPromiscuityReferenceCount(t *testing.T) {
+	requireRoot(t)
+
+	const name = "vfhyg5"
+	link := mkDummy(t, name)
+	ops := NewNetlinkStateOps()
+	vf := VF{PCIAddress: "0000:d8:00.5", NetdevName: name}
+
+	// First reference: the administrative flag, as `ip link set promisc on`
+	// leaves it.
+	if err := netlink.SetPromiscOn(link); err != nil {
+		t.Fatalf("failed to set promisc on: %v", err)
+	}
+
+	// Second reference: a packet socket joined to the promiscuous group,
+	// which is how a workload that reads raw frames takes its own reference.
+	// Repeating the rtnetlink call cannot produce this -- dev_change_flags
+	// only increments on the 0 to 1 transition -- so the count can only be
+	// raised above one by an in-kernel requester of this kind.
+	closeSock := addPacketPromisc(t, name)
+	closed := false
+	_ = closed
+	defer func() { closeSock() }()
+
+	fresh, err := netlink.LinkByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fresh.Attrs().Promisc; got < 2 {
+		t.Skipf("kernel reported promiscuity %d, expected a reference count of at least 2", got)
+	}
+
+	// With a live in-kernel requester the count cannot be driven to zero, and
+	// it would be wrong to try: rtnetlink can only release the
+	// administrative reference, and once IFF_PROMISC is clear further
+	// requests are no-ops. The requirement is therefore not that cleanup
+	// succeeds, but that it does not claim to have cleaned a device that is
+	// still promiscuous.
+	if _, err := ops.Restore(vf, State{}, []Attribute{AttrPromisc}); err == nil {
+		t.Fatal("cleanup reported success while another requester still holds promiscuity; " +
+			"a released VF would be recorded as clean while still promiscuous")
+	}
+
+	state, err := ops.GetState(vf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Promisc {
+		t.Fatal("device should still be promiscuous while the packet socket holds a reference")
+	}
+
+	// Once the requester releases, the device drops out of promiscuous mode
+	// on its own and cleanup has nothing left to do. This is why a workload
+	// that takes promiscuity through a socket does not leave it behind on
+	// exit, and why the state that does persist is the administrative flag.
+	closeSock()
+
+	fresh, err = netlink.LinkByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := fresh.Attrs().Promisc; count != 0 {
+		t.Fatalf("expected promiscuity to fall to 0 after the socket closed, got %d", count)
+	}
+}
+
+// addPacketPromisc opens a packet socket and joins the interface's promiscuous
+// group, taking a kernel reference on promiscuity exactly as a workload reading
+// raw frames does. It returns a function that closes the socket.
+func addPacketPromisc(t *testing.T, iface string) func() {
+	t.Helper()
+
+	link, err := net.InterfaceByName(iface)
+	if err != nil {
+		t.Fatalf("look up %s: %v", iface, err)
+	}
+
+	proto := int(htons16(unix.ETH_P_ALL))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, proto)
+	if err != nil {
+		t.Skipf("packet socket unavailable: %v", err)
+	}
+
+	mreq := unix.PacketMreq{
+		Ifindex: int32(link.Index),
+		Type:    unix.PACKET_MR_PROMISC,
+	}
+	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, &mreq); err != nil {
+		unix.Close(fd)
+		t.Skipf("cannot join promiscuous group: %v", err)
+	}
+
+	return func() { unix.Close(fd) }
+}
+
+func htons16(v uint16) uint16 { return (v<<8)&0xff00 | v>>8 }
